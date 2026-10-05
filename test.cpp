@@ -53,9 +53,9 @@ int method_conflict(Counter* c) {
 
 // 6. Two shared loans on the same place.
 int two_shared(Entity* e) {
-    int* a = &e->hp;
-    int* b = &e->hp;
-    return *a + *b;
+    const int& a = e->hp;
+    const int& b = e->hp;
+    return a + b;
 }
 
 // 7. Disjoint fields.
@@ -88,7 +88,7 @@ int method_different_object(Counter* c, Entity* e) {
 
 // 11. Const method call while a loan on the receiver is live.
 int const_method_ok(Counter* c) {
-    int* p = &c->count;
+    const int& p = c->count;
     int  v = c->get();
-    return *p + v;
+    return p + v;
 }

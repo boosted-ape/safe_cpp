@@ -24,3 +24,17 @@ target_link_libraries(mir-builder
     LLVMSupport
     clang-cpp
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_executable(mir-verifier-tests
+        src/verifier_test.cpp
+        src/verifier.cpp
+    )
+    target_include_directories(mir-verifier-tests PRIVATE src)
+    add_test(NAME mir-verifier-invariants COMMAND mir-verifier-tests)
+    add_test(NAME borrow-checker-expected-results
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_expected.py
+                $<TARGET_FILE:mir-builder> ${CMAKE_CURRENT_SOURCE_DIR})
+endif()

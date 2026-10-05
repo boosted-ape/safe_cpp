@@ -107,7 +107,7 @@ struct Aggregate {
 };
 
 struct Rvalue {
-    enum class Kind { Use, BinaryOp, UnaryOp, Ref, Aggregate } kind = Kind::Use;
+    enum class Kind { Use, BinaryOp, UnaryOp, Ref, Cast, Aggregate } kind = Kind::Use;
 
     std::optional<Operand> operand;
     std::optional<BinOp> binop;
@@ -115,6 +115,7 @@ struct Rvalue {
     std::optional<Operand> lhs, rhs;
     std::optional<Place> ref_place;
     std::optional<bool>  ref_mut;
+    std::string cast_type;
     std::optional<Aggregate> aggregate;
 
     static Rvalue use(Operand op) {
@@ -130,6 +131,9 @@ struct Rvalue {
     static Rvalue ref(Place p, bool is_mut) {
         Rvalue r; r.kind = Kind::Ref; r.ref_place = std::move(p); r.ref_mut = is_mut; return r;
     }
+    static Rvalue cast(Operand op, std::string type) {
+        Rvalue r; r.kind = Kind::Cast; r.operand = std::move(op); r.cast_type = std::move(type); return r;
+    }
     static Rvalue make_aggregate(Aggregate a) {
         Rvalue r; r.kind = Kind::Aggregate; r.aggregate = std::move(a); return r;
     }
@@ -137,10 +141,11 @@ struct Rvalue {
 
 // ---------- Statements ----------
 struct Statement {
-    enum class Kind { StorageLive, StorageDead, Assign, Nop } kind = Kind::StorageLive;
+    enum class Kind { StorageLive, StorageDead, Assign, ReserveBorrow, Nop } kind = Kind::StorageLive;
     LocalId local = 0;
     std::optional<Place> place;
     std::optional<Rvalue> rvalue;
+    bool reserve_mut = false;
 
     static Statement storage_live(LocalId l) {
         Statement s; s.kind = Kind::StorageLive; s.local = l; return s;
@@ -152,6 +157,9 @@ struct Statement {
         Statement s; s.kind = Kind::Assign;
         s.place = std::move(p); s.rvalue = std::move(r); return s;
     }
+    static Statement reserve_borrow(Place p, bool is_mut) {
+        Statement s; s.kind = Kind::ReserveBorrow; s.place = std::move(p); s.reserve_mut = is_mut; return s;
+    }
     static Statement nop() { Statement s; s.kind = Kind::Nop; return s; }
 };
 
@@ -159,7 +167,7 @@ struct Statement {
 struct SwitchTarget { int64_t value = 0; BlockId target = 0; };
 
 struct Terminator {
-    enum class Kind { Goto, SwitchInt, Return, Call, Unreachable, Drop } kind = Kind::Goto;
+    enum class Kind { Goto, SwitchInt, Return, Call, Unreachable, Drop, Throw } kind = Kind::Goto;
 
     BlockId target = 0;
     std::optional<Operand> switch_on;
@@ -168,6 +176,7 @@ struct Terminator {
     std::optional<Operand> return_value;
 
     std::string call_callee;
+    std::string call_summary_key;
     std::vector<Operand> call_args;
     std::optional<Place> call_destination;
     std::optional<Place> call_receiver;
@@ -177,6 +186,8 @@ struct Terminator {
     bool call_is_destructor = false;
 
     std::optional<Place> drop_place;
+    std::optional<Operand> thrown_value;
+    std::optional<Origin> receiver_reservation;
 
     static Terminator goto_(BlockId t) {
         Terminator x; x.kind = Kind::Goto; x.target = t; return x;
@@ -187,6 +198,9 @@ struct Terminator {
     static Terminator unreachable() { Terminator x; x.kind = Kind::Unreachable; return x; }
     static Terminator drop(Place p, BlockId t) {
         Terminator x; x.kind = Kind::Drop; x.drop_place = std::move(p); x.target = t; return x;
+    }
+    static Terminator throw_(std::optional<Operand> value, BlockId handler = INVALID_BLOCK) {
+        Terminator x; x.kind = Kind::Throw; x.thrown_value = std::move(value); x.target = handler; return x;
     }
 };
 
@@ -205,11 +219,13 @@ struct LocalDecl {
     bool is_temp = false;
     bool is_mut = true;
     bool is_this = false;
+    bool needs_drop = false;
     std::optional<Origin> origin;
 };
 
 struct Body {
     std::string name;
+    std::string summary_key;
     std::string return_type;
     std::vector<LocalDecl> locals;
     std::vector<BasicBlockData> blocks;

@@ -1,15 +1,24 @@
 #pragma once
 #include "mir.hpp"
 #include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/Basic/SourceLocation.h>
 #include <map>
 
 namespace mir {
+
+struct UnsupportedFeature {
+    clang::SourceLocation location;
+    std::string message;
+};
 
 class MIRBuilder : public clang::RecursiveASTVisitor<MIRBuilder> {
 public:
     explicit MIRBuilder(clang::ASTContext& ctx) : ctx_(ctx) {}
     bool VisitFunctionDecl(clang::FunctionDecl* fd);
     std::vector<Body> bodies;
+    std::vector<UnsupportedFeature> unsupported_errors;
+    bool VisitCXXNewExpr(clang::CXXNewExpr* e);
+    bool VisitCXXDeleteExpr(clang::CXXDeleteExpr* e);
 
 private:
     clang::ASTContext& ctx_;
@@ -23,6 +32,8 @@ private:
 
     struct LoopCtx { BlockId continue_target; BlockId break_target; };
     std::vector<LoopCtx> loop_stack_;
+    std::vector<BlockId> exception_targets_;
+    std::map<const clang::SwitchCase*, BlockId> switch_case_blocks_;
 
     LocalId declare_local(const std::string& name, const std::string& type,
                           bool is_arg, bool is_temp, bool is_mut = true,
@@ -32,6 +43,7 @@ private:
     void emit_assign(Place dest, Rvalue rv);
     void terminate(Terminator t);
     bool is_terminated() const;
+    void mark_unsupported(clang::SourceLocation location, std::string message);
     void push_scope();
     void pop_scope();
 
@@ -42,6 +54,9 @@ private:
     void lower_while_stmt(clang::WhileStmt* ws);
     void lower_for_stmt(clang::ForStmt* fs);
     void lower_do_stmt(clang::DoStmt* ds);
+    void lower_switch_stmt(clang::SwitchStmt* ss);
+    void lower_range_for_stmt(clang::CXXForRangeStmt* fs);
+    void lower_try_stmt(clang::CXXTryStmt* ts);
     void lower_break_stmt(clang::BreakStmt* bs);
     void lower_continue_stmt(clang::ContinueStmt* cs);
     void lower_assign_op(clang::BinaryOperator* bo);

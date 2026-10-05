@@ -66,6 +66,11 @@ static void print_rvalue(const Rvalue& rv, std::ostream& os) {
             os << (rv.ref_mut && *rv.ref_mut ? "&mut " : "&");
             print_place(*rv.ref_place, os);
             break;
+        case Rvalue::Kind::Cast:
+            os << "cast<" << rv.cast_type << ">(";
+            print_operand(*rv.operand, os);
+            os << ")";
+            break;
         case Rvalue::Kind::Aggregate: {
             const auto& agg = *rv.aggregate;
             os << (agg.kind == Aggregate::Kind::Struct ? agg.struct_name : "[");
@@ -88,6 +93,10 @@ static void print_statement(const Statement& s, std::ostream& os) {
             print_place(*s.place, os);
             os << " = ";
             print_rvalue(*s.rvalue, os);
+            break;
+        case Statement::Kind::ReserveBorrow:
+            os << (s.reserve_mut ? "reserve_mut " : "reserve_shared ");
+            print_place(*s.place, os);
             break;
         case Statement::Kind::Nop: os << "nop"; break;
     }
@@ -128,6 +137,7 @@ static void print_terminator(const Terminator& t, std::ostream& os) {
             }
             os << ")";
             if (t.call_is_virtual) os << " [virtual]";
+            if (t.receiver_reservation) os << " [two-phase reserve bb" << t.receiver_reservation->create_block << ":" << t.receiver_reservation->create_stmt << "]";
             os << " -> bb" << t.target;
             break;
         }
@@ -138,6 +148,11 @@ static void print_terminator(const Terminator& t, std::ostream& os) {
             os << "drop(";
             print_place(*t.drop_place, os);
             os << ") -> bb" << t.target;
+            break;
+        case Terminator::Kind::Throw:
+            os << "throw";
+            if (t.thrown_value) { os << " "; print_operand(*t.thrown_value, os); }
+            if (t.target != INVALID_BLOCK) os << " -> bb" << t.target;
             break;
     }
 }

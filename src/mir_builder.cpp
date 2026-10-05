@@ -5,11 +5,37 @@
 #include <clang/AST/Expr.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/Stmt.h>
+#include <clang/Basic/SourceManager.h>
+#include <clang/Index/USRGeneration.h>
 #include <llvm/Support/Casting.h>
+#include <llvm/ADT/SmallString.h>
 
 using namespace clang;
 
 namespace mir {
+
+static std::string summary_key_for(const Decl* decl) {
+    if (!decl) return {};
+    llvm::SmallString<128> usr;
+    if (const auto* named = llvm::dyn_cast<NamedDecl>(decl)) {
+        if (!index::generateUSRForDecl(named->getCanonicalDecl(), usr)) return std::string(usr.str());
+        return named->getQualifiedNameAsString();
+    }
+    return {};
+}
+
+void MIRBuilder::mark_unsupported(SourceLocation location, std::string message) {
+    unsupported_errors.push_back({location, std::move(message)});
+}
+
+bool MIRBuilder::VisitCXXNewExpr(CXXNewExpr* e) {
+    mark_unsupported(e->getBeginLoc(), "manual allocation with 'new' is unsupported");
+    return true;
+}
+bool MIRBuilder::VisitCXXDeleteExpr(CXXDeleteExpr* e) {
+    mark_unsupported(e->getBeginLoc(), "manual deallocation with 'delete' is unsupported");
+    return true;
+}
 
 // ---------- types ----------
 std::string MIRBuilder::type_str(QualType qt) { return qt.getAsString(); }
@@ -95,17 +121,32 @@ void MIRBuilder::emit_assign(Place dest, Rvalue rv) {
     uint32_t idx = static_cast<uint32_t>(body_->blocks[blk].statements.size());
 
     std::optional<Origin> new_origin;
+    bool destination_can_carry_origin = dest_local < body_->locals.size()
+        && (body_->locals[dest_local].type.kind == Type::Kind::Ref
+            || body_->locals[dest_local].type.kind == Type::Kind::RawPtr
+            || body_->locals[dest_local].type.kind == Type::Kind::Struct
+            || body_->locals[dest_local].type.kind == Type::Kind::Container
+            || body_->locals[dest_local].type.kind == Type::Kind::Unknown);
     if (rv.kind == Rvalue::Kind::Ref) {
         new_origin = Origin{blk, idx};
-    } else if (rv.kind == Rvalue::Kind::Use && rv.operand
-               && rv.operand->kind != Operand::Kind::Constant
-               && rv.operand->place.is_plain_local()) {
+    } else if (destination_can_carry_origin && rv.kind == Rvalue::Kind::Use && rv.operand
+               && rv.operand->kind != Operand::Kind::Constant) {
         LocalId src = rv.operand->place.local;
         if (src < body_->locals.size()) {
             new_origin = body_->locals[src].origin;
             if (rv.operand->kind == Operand::Kind::Move)
                 body_->locals[src].origin.reset();
         }
+    } else if (destination_can_carry_origin && rv.kind == Rvalue::Kind::Aggregate && rv.aggregate) {
+        for (const auto& el : rv.aggregate->elements) {
+            if (el.kind == Operand::Kind::Constant || el.place.local >= body_->locals.size()) continue;
+            new_origin = body_->locals[el.place.local].origin;
+            if (new_origin) break;
+        }
+    } else if (destination_can_carry_origin && rv.kind == Rvalue::Kind::Cast && rv.operand
+               && rv.operand->kind != Operand::Kind::Constant
+               && rv.operand->place.local < body_->locals.size()) {
+        new_origin = body_->locals[rv.operand->place.local].origin;
     }
     if (dest_local < body_->locals.size())
         body_->locals[dest_local].origin = new_origin;
@@ -126,22 +167,32 @@ void MIRBuilder::push_scope() { scopes_.emplace_back(); }
 void MIRBuilder::pop_scope() {
     if (scopes_.empty()) return;
     auto& scope = scopes_.back();
-    for (auto it = scope.locals.rbegin(); it != scope.locals.rend(); ++it)
+    for (auto it = scope.locals.rbegin(); it != scope.locals.rend(); ++it) {
+        if (body_->locals[*it].needs_drop && !is_terminated()) {
+            BlockId next = new_block();
+            terminate(Terminator::drop(Place{*it}, next));
+            current_block_ = next;
+        }
         if (!body_->locals[*it].is_temp) emit(Statement::storage_dead(*it));
+    }
     scopes_.pop_back();
 }
 
 // ---------- function-level ----------
 bool MIRBuilder::VisitFunctionDecl(FunctionDecl* fd) {
     if (!fd->hasBody()) return true;
+    if (ctx_.getSourceManager().isInSystemHeader(fd->getLocation())) return true;
 
     Body body;
-    body.name = fd->getNameAsString();
+    body.name = fd->getQualifiedNameAsString();
+    body.summary_key = summary_key_for(fd);
     body.return_type = type_str(fd->getReturnType());
     body_ = &body;
     var_to_local_.clear();
     scopes_.clear();
     loop_stack_.clear();
+    exception_targets_.clear();
+    switch_case_blocks_.clear();
     this_local_ = INVALID_BLOCK;
 
     body.start_block = 0;
@@ -164,6 +215,8 @@ bool MIRBuilder::VisitFunctionDecl(FunctionDecl* fd) {
         LocalId lid = declare_local(param->getNameAsString(),
                                     type_str(param->getType()), true, false);
         body.locals[lid].type = build_type(param->getType());
+        if (const auto* rd = param->getType()->getAsCXXRecordDecl())
+            body.locals[lid].needs_drop = rd->hasNonTrivialDestructor();
         var_to_local_[param] = lid;
         emit(Statement::storage_live(lid));
     }
@@ -185,11 +238,20 @@ void MIRBuilder::lower_decl_stmt(DeclStmt* ds) {
             LocalId lid = declare_local(vd->getNameAsString(), type_str(vd->getType()),
                                         false, false, is_mut);
             body_->locals[lid].type = build_type(vd->getType());
+            if (const auto* rd = vd->getType()->getAsCXXRecordDecl())
+                body_->locals[lid].needs_drop = rd->hasNonTrivialDestructor();
             var_to_local_[vd] = lid;
             emit(Statement::storage_live(lid));
             if (vd->hasInit()) {
-                Operand val = lower_operand(vd->getInit());
-                emit_assign(Place{lid}, Rvalue::use(val));
+                if (vd->getType()->isReferenceType()) {
+                    Expr* init = vd->getInit()->IgnoreParenImpCasts();
+                    Place referent = lower_expr(init);
+                    bool mut = !vd->getType().getNonReferenceType().isConstQualified();
+                    emit_assign(Place{lid}, Rvalue::ref(referent, mut));
+                } else {
+                    Operand val = lower_operand(vd->getInit());
+                    emit_assign(Place{lid}, Rvalue::use(val));
+                }
             }
         }
     }
@@ -198,7 +260,18 @@ void MIRBuilder::lower_decl_stmt(DeclStmt* ds) {
 void MIRBuilder::lower_return_stmt(ReturnStmt* rs) {
     std::optional<Operand> ret_val;
     if (auto* e = rs->getRetValue()) ret_val = lower_operand(e);
-    terminate(Terminator::ret(std::move(ret_val)));
+    std::vector<LocalId> drops;
+    for (auto si = scopes_.rbegin(); si != scopes_.rend(); ++si)
+        for (auto li = si->locals.rbegin(); li != si->locals.rend(); ++li)
+            if (body_->locals[*li].needs_drop) drops.push_back(*li);
+    if (drops.empty()) { terminate(Terminator::ret(std::move(ret_val))); return; }
+    BlockId tail = new_block(), saved = current_block_;
+    current_block_ = tail; terminate(Terminator::ret(std::move(ret_val)));
+    for (auto it = drops.rbegin(); it != drops.rend(); ++it) {
+        BlockId next = tail, drop_bb = new_block();
+        current_block_ = drop_bb; terminate(Terminator::drop(Place{*it}, next)); tail = drop_bb;
+    }
+    current_block_ = saved; terminate(Terminator::goto_(tail));
 }
 
 void MIRBuilder::lower_if_stmt(IfStmt* is) {
@@ -299,6 +372,88 @@ void MIRBuilder::lower_do_stmt(DoStmt* ds) {
     current_block_ = exit_bb;
 }
 
+void MIRBuilder::lower_range_for_stmt(CXXForRangeStmt* fs) {
+    push_scope();
+    lower_stmt(fs->getRangeStmt());
+    lower_stmt(fs->getBeginStmt());
+    lower_stmt(fs->getEndStmt());
+    BlockId header = new_block(), body_bb = new_block(), inc_bb = new_block(), exit_bb = new_block();
+    terminate(Terminator::goto_(header));
+    current_block_ = header;
+    (void)lower_expr_to_local(fs->getCond());
+    Place cond = lower_expr(fs->getCond());
+    Terminator branch;
+    branch.kind = Terminator::Kind::SwitchInt;
+    branch.switch_on = Operand::make_copy(cond, "bool");
+    branch.switch_targets.push_back({1, body_bb}); branch.switch_default = exit_bb;
+    terminate(std::move(branch));
+    loop_stack_.push_back({inc_bb, exit_bb});
+    current_block_ = body_bb;
+    lower_stmt(fs->getLoopVarStmt());
+    lower_stmt(fs->getBody());
+    if (!is_terminated()) terminate(Terminator::goto_(inc_bb));
+    current_block_ = inc_bb;
+    lower_stmt(fs->getInc());
+    if (!is_terminated()) terminate(Terminator::goto_(header));
+    loop_stack_.pop_back();
+    current_block_ = exit_bb;
+    pop_scope();
+}
+
+void MIRBuilder::lower_try_stmt(CXXTryStmt* ts) {
+    BlockId join = new_block();
+    std::vector<BlockId> catches;
+    for (unsigned i = 0; i < ts->getNumHandlers(); ++i) catches.push_back(new_block());
+    BlockId dispatch = catches.empty() ? INVALID_BLOCK : catches.front();
+    exception_targets_.push_back(dispatch);
+    lower_stmt(ts->getTryBlock());
+    exception_targets_.pop_back();
+    if (!is_terminated()) terminate(Terminator::goto_(join));
+    for (unsigned i = 0; i < ts->getNumHandlers(); ++i) {
+        auto* handler = ts->getHandler(i);
+        if (auto* exception = handler->getExceptionDecl()) {
+            mark_unsupported(exception->getLocation(),
+                "catch parameter values are not represented in MIR");
+            LocalId lid = declare_local(exception->getNameAsString(),
+                type_str(exception->getType()), false, false);
+            var_to_local_[exception] = lid;
+            emit(Statement::storage_live(lid));
+        }
+        current_block_ = catches[i];
+        lower_stmt(handler->getHandlerBlock());
+        if (!is_terminated()) terminate(Terminator::goto_(join));
+    }
+    current_block_ = join;
+}
+
+void MIRBuilder::lower_switch_stmt(SwitchStmt* ss) {
+    Place value = lower_expr(ss->getCond());
+    BlockId exit = new_block();
+    std::vector<std::pair<const SwitchCase*, BlockId>> cases;
+    for (SwitchCase* sc = ss->getSwitchCaseList(); sc; sc = sc->getNextSwitchCase())
+        cases.push_back({sc, new_block()});
+    BlockId default_block = exit;
+    Terminator sw; sw.kind = Terminator::Kind::SwitchInt; sw.switch_on = Operand::make_copy(value, type_str(ss->getCond()->getType()));
+    for (auto [sc, bb] : cases) {
+        switch_case_blocks_[sc] = bb;
+        if (auto* cs = llvm::dyn_cast<CaseStmt>(sc)) {
+            Expr::EvalResult result;
+            if (cs->getLHS()->EvaluateAsInt(result, ctx_))
+                sw.switch_targets.push_back({result.Val.getInt().getSExtValue(), bb});
+        } else if (llvm::isa<DefaultStmt>(sc)) default_block = bb;
+    }
+    sw.switch_default = default_block;
+    terminate(std::move(sw));
+    std::reverse(cases.begin(), cases.end());
+    loop_stack_.push_back({exit, exit});
+    for (size_t i = 0; i < cases.size(); ++i) {
+        current_block_ = cases[i].second;
+        lower_stmt(const_cast<Stmt*>(cases[i].first->getSubStmt()));
+        if (!is_terminated()) terminate(Terminator::goto_(i + 1 < cases.size() ? cases[i + 1].second : exit));
+    }
+    loop_stack_.pop_back(); current_block_ = exit;
+}
+
 void MIRBuilder::lower_break_stmt(BreakStmt*) {
     if (loop_stack_.empty()) return;
     terminate(Terminator::goto_(loop_stack_.back().break_target));
@@ -324,6 +479,10 @@ void MIRBuilder::lower_assign_op(BinaryOperator* bo) {
         case BO_RemAssign: op = BinOp::Mod; break;
         default: break;
     }
+    if (op == BinOp::Unknown) {
+        mark_unsupported(bo->getOperatorLoc(), "compound assignment is not represented in MIR");
+        return;
+    }
     Operand lhs_copy = Operand::make_copy(lhs);
     emit_assign(lhs, Rvalue::binary(op, lhs_copy, rhs));
 }
@@ -331,6 +490,7 @@ void MIRBuilder::lower_assign_op(BinaryOperator* bo) {
 void MIRBuilder::lower_stmt(Stmt* s) {
     if (is_terminated()) return;
 
+    if (llvm::isa<NullStmt>(s)) return;
     if (auto* cs = llvm::dyn_cast<CompoundStmt>(s)) {
         push_scope();
         for (auto* child : cs->body()) lower_stmt(child);
@@ -341,8 +501,33 @@ void MIRBuilder::lower_stmt(Stmt* s) {
     else if (auto* ws = llvm::dyn_cast<WhileStmt>(s))      lower_while_stmt(ws);
     else if (auto* fs = llvm::dyn_cast<ForStmt>(s))        lower_for_stmt(fs);
     else if (auto* dos = llvm::dyn_cast<DoStmt>(s))        lower_do_stmt(dos);
+    else if (auto* range = llvm::dyn_cast<CXXForRangeStmt>(s)) lower_range_for_stmt(range);
+    else if (auto* sw = llvm::dyn_cast<SwitchStmt>(s))     lower_switch_stmt(sw);
+    else if (auto* ts = llvm::dyn_cast<CXXTryStmt>(s))     lower_try_stmt(ts);
+    else if (auto* th = llvm::dyn_cast<CXXThrowExpr>(s)) {
+        std::optional<Operand> val;
+        if (th->getSubExpr()) val = lower_operand(th->getSubExpr());
+        terminate(Terminator::throw_(std::move(val), exception_targets_.empty()
+            ? INVALID_BLOCK : exception_targets_.back()));
+    }
     else if (auto* bs = llvm::dyn_cast<BreakStmt>(s))      lower_break_stmt(bs);
     else if (auto* cs = llvm::dyn_cast<ContinueStmt>(s))   lower_continue_stmt(cs);
+    else if (auto* cs = llvm::dyn_cast<CaseStmt>(s)) {
+        auto it = switch_case_blocks_.find(cs);
+        if (it != switch_case_blocks_.end()) {
+            if (!is_terminated() && current_block_ != it->second) terminate(Terminator::goto_(it->second));
+            current_block_ = it->second;
+        }
+        lower_stmt(cs->getSubStmt());
+    }
+    else if (auto* ds = llvm::dyn_cast<DefaultStmt>(s)) {
+        auto it = switch_case_blocks_.find(ds);
+        if (it != switch_case_blocks_.end()) {
+            if (!is_terminated() && current_block_ != it->second) terminate(Terminator::goto_(it->second));
+            current_block_ = it->second;
+        }
+        lower_stmt(ds->getSubStmt());
+    }
     else if (auto* bo = llvm::dyn_cast<BinaryOperator>(s)) {
         switch (bo->getOpcode()) {
             case BO_Assign:
@@ -359,6 +544,7 @@ void MIRBuilder::lower_stmt(Stmt* s) {
         }
     }
     else if (auto* es = llvm::dyn_cast<Expr>(s))           (void)lower_expr_to_local(es);
+    else mark_unsupported(s->getBeginLoc(), "statement kind is not represented in MIR");
 }
 
 // ---------- expressions ----------
@@ -368,12 +554,17 @@ Place MIRBuilder::lower_expr(Expr* e) {
     if (auto* dre = llvm::dyn_cast<DeclRefExpr>(e)) {
         if (auto* vd = llvm::dyn_cast<VarDecl>(dre->getDecl())) {
             auto it = var_to_local_.find(vd);
-            if (it != var_to_local_.end()) return Place{it->second};
+            if (it != var_to_local_.end()) {
+                Place p{it->second};
+                if (vd->getType()->isReferenceType()) { Projection d; d.kind = ProjectionKind::Deref; p.projections.push_back(d); }
+                return p;
+            }
         }
     }
 
     if (llvm::isa<CXXThisExpr>(e)) {
         if (this_local_ != INVALID_BLOCK) return Place{this_local_};
+        mark_unsupported(e->getExprLoc(), "'this' is not available in this MIR body");
         return Place{0};
     }
 
@@ -425,12 +616,23 @@ Place MIRBuilder::lower_expr(Expr* e) {
 LocalId MIRBuilder::lower_expr_to_local(Expr* e) { return lower_expr(e).local; }
 
 Operand MIRBuilder::lower_operand(Expr* e) {
+    // std::move is an explicit ownership transfer. Preserve it before
+    // stripping implicit casts and parentheses.
+    Expr* original = e;
+    if (auto* call = llvm::dyn_cast<CallExpr>(original->IgnoreParenImpCasts())) {
+        if (auto* ref = llvm::dyn_cast<DeclRefExpr>(call->getCallee()->IgnoreParenImpCasts())) {
+            if (ref->getDecl()->getName() == "move" && call->getNumArgs() == 1)
+                return Operand::make_move(lower_expr(call->getArg(0)), type_str(e->getType()));
+        }
+    }
     e = e->IgnoreParenImpCasts();
     if (auto* il = llvm::dyn_cast<IntegerLiteral>(e))
         return Operand::make_const(il->getValue().getSExtValue(), type_str(e->getType()));
     if (auto* bl = llvm::dyn_cast<CXXBoolLiteralExpr>(e))
         return Operand::make_const(bl->getValue() ? 1 : 0, "bool");
     Place p = lower_expr(e);
+    if (e->getType()->isRecordType())
+        return Operand::make_move(p, type_str(e->getType()));
     return Operand::make_copy(p, type_str(e->getType()));
 }
 
@@ -497,6 +699,14 @@ LocalId MIRBuilder::lower_logical_or(BinaryOperator* bo) {
 
 LocalId MIRBuilder::lower_unary_op(UnaryOperator* uo) {
     switch (uo->getOpcode()) {
+        case UO_PreInc: case UO_PostInc: case UO_PreDec: case UO_PostDec: {
+            Place p = lower_expr(uo->getSubExpr());
+            Operand old = Operand::make_copy(p, type_str(uo->getType()));
+            Operand one = Operand::make_const(1, type_str(uo->getType()));
+            BinOp op = (uo->getOpcode() == UO_PreInc || uo->getOpcode() == UO_PostInc) ? BinOp::Add : BinOp::Sub;
+            emit_assign(p, Rvalue::binary(op, old, one));
+            return p.local;
+        }
         case UO_Minus:
         case UO_LNot: {
             Operand v = lower_operand(uo->getSubExpr());
@@ -526,6 +736,7 @@ LocalId MIRBuilder::lower_unary_op(UnaryOperator* uo) {
             return tmp;
         }
         default: {
+            mark_unsupported(uo->getOperatorLoc(), "unary operator is not represented in MIR");
             LocalId tmp = declare_local("", type_str(uo->getType()), false, true);
             emit(Statement::storage_live(tmp));
             return tmp;
@@ -566,12 +777,13 @@ LocalId MIRBuilder::lower_call(CallExpr* ce) {
 
     QualType ret_qt = ce->getCallReturnType(ctx_);
     LocalId dest = declare_local("", type_str(ret_qt), false, true);
+    body_->locals[dest].type = build_type(ret_qt);
     emit(Statement::storage_live(dest));
 
     std::string callee_name;
     Expr* callee = ce->getCallee()->IgnoreParenImpCasts();
-    if (auto* dre = llvm::dyn_cast<DeclRefExpr>(callee))
-        callee_name = dre->getDecl()->getNameAsString();
+    if (auto* direct = ce->getDirectCallee()) callee_name = direct->getQualifiedNameAsString();
+    else if (auto* dre = llvm::dyn_cast<DeclRefExpr>(callee)) callee_name = dre->getDecl()->getQualifiedNameAsString();
     else
         callee_name = "<indirect>";
 
@@ -579,6 +791,7 @@ LocalId MIRBuilder::lower_call(CallExpr* ce) {
     Terminator t;
     t.kind = Terminator::Kind::Call;
     t.call_callee = callee_name;
+    t.call_summary_key = summary_key_for(ce->getDirectCallee());
     t.call_args = std::move(args);
     t.call_destination = Place{dest};
     t.target = target;
@@ -605,21 +818,32 @@ LocalId MIRBuilder::lower_member_call(CXXMemberCallExpr* mce) {
         receiver = Place{this_local_};
     }
 
+    bool receiver_is_mut = md ? !md->isConst() : true;
+    std::optional<Origin> reservation;
+    if (receiver_is_mut && !is_terminated()) {
+        auto& statements = body_->blocks[current_block_].statements;
+        reservation = Origin{current_block_, static_cast<uint32_t>(statements.size())};
+        emit(Statement::reserve_borrow(receiver, true));
+    }
+
     std::vector<Operand> args;
     for (auto* a : mce->arguments()) args.push_back(lower_operand(a));
 
     QualType ret_qt = mce->getCallReturnType(ctx_);
     LocalId dest = declare_local("", type_str(ret_qt), false, true);
+    body_->locals[dest].type = build_type(ret_qt);
     emit(Statement::storage_live(dest));
 
     BlockId target = new_block();
     Terminator t;
     t.kind = Terminator::Kind::Call;
     t.call_callee = md ? md->getQualifiedNameAsString() : "<method>";
+    t.call_summary_key = summary_key_for(md);
     t.call_args = std::move(args);
     t.call_destination = Place{dest};
     t.call_receiver = receiver;
-    t.call_receiver_is_mut = md ? !md->isConst() : true;
+    t.call_receiver_is_mut = receiver_is_mut;
+    t.receiver_reservation = reservation;
     t.call_is_virtual = md ? md->isVirtual() : false;
     t.target = target;
     terminate(t);
@@ -633,6 +857,7 @@ LocalId MIRBuilder::lower_construct(CXXConstructExpr* cce) {
 
     QualType qt = cce->getType();
     LocalId dest = declare_local("", type_str(qt), false, true);
+    body_->locals[dest].type = build_type(qt);
     emit(Statement::storage_live(dest));
 
     const CXXConstructorDecl* ctor = cce->getConstructor();
@@ -642,6 +867,7 @@ LocalId MIRBuilder::lower_construct(CXXConstructExpr* cce) {
     Terminator t;
     t.kind = Terminator::Kind::Call;
     t.call_callee = name;
+    t.call_summary_key = summary_key_for(ctor);
     t.call_args = std::move(args);
     t.call_destination = Place{dest};
     t.call_is_constructor = true;
@@ -670,6 +896,13 @@ LocalId MIRBuilder::lower_init_list(InitListExpr* ile) {
 }
 
 LocalId MIRBuilder::lower_rvalue_to_temp(Expr* e) {
+    if (auto* cast = llvm::dyn_cast<ExplicitCastExpr>(e->IgnoreParenImpCasts())) {
+        Operand src = lower_operand(cast->getSubExpr());
+        LocalId tmp = declare_local("", type_str(cast->getType()), false, true);
+        emit(Statement::storage_live(tmp));
+        emit_assign(Place{tmp}, Rvalue::cast(std::move(src), type_str(cast->getType())));
+        return tmp;
+    }
     e = e->IgnoreParenImpCasts();
 
     if (auto* il = llvm::dyn_cast<IntegerLiteral>(e)) {
@@ -686,6 +919,12 @@ LocalId MIRBuilder::lower_rvalue_to_temp(Expr* e) {
              bl->getValue() ? 1 : 0, "bool")));
         return tmp;
     }
+    if (llvm::isa<GNUNullExpr>(e) || llvm::isa<CXXNullPtrLiteralExpr>(e)) {
+        LocalId tmp = declare_local("", type_str(e->getType()), false, true);
+        emit(Statement::storage_live(tmp));
+        emit_assign(Place{tmp}, Rvalue::use(Operand::make_const(0, type_str(e->getType()))));
+        return tmp;
+    }
 
     if (auto* bo = llvm::dyn_cast<BinaryOperator>(e)) {
         if (bo->getOpcode() == BO_LAnd) return lower_logical_and(bo);
@@ -695,6 +934,12 @@ LocalId MIRBuilder::lower_rvalue_to_temp(Expr* e) {
             Operand rhs = lower_operand(bo->getRHS());
             emit_assign(lhs, Rvalue::use(rhs));
             return lhs.local;
+        }
+        if (map_binop(bo->getOpcode()) == BinOp::Unknown) {
+            mark_unsupported(bo->getOperatorLoc(), "binary operator is not represented in MIR");
+            LocalId tmp = declare_local("", type_str(e->getType()), false, true);
+            emit(Statement::storage_live(tmp));
+            return tmp;
         }
         return lower_binary_op(bo);
     }
@@ -707,6 +952,29 @@ LocalId MIRBuilder::lower_rvalue_to_temp(Expr* e) {
     if (auto* cce = llvm::dyn_cast<CXXConstructExpr>(e))  return lower_construct(cce);
     if (auto* ile = llvm::dyn_cast<InitListExpr>(e))      return lower_init_list(ile);
 
+    if (auto* ne = llvm::dyn_cast<CXXNewExpr>(e)) {
+        std::vector<Operand> args;
+        if (ne->getInitializer())
+            if (auto* init = llvm::dyn_cast<InitListExpr>(ne->getInitializer()))
+                for (Expr* a : init->inits()) args.push_back(lower_operand(a));
+            else args.push_back(lower_operand(ne->getInitializer()));
+        LocalId dest = declare_local("", type_str(e->getType()), false, true);
+        emit(Statement::storage_live(dest));
+        BlockId target = new_block(); Terminator t;
+        t.kind = Terminator::Kind::Call; t.call_callee = "operator new";
+        t.call_args = std::move(args); t.call_destination = Place{dest}; t.target = target;
+        terminate(std::move(t)); current_block_ = target; return dest;
+    }
+    if (auto* de = llvm::dyn_cast<CXXDeleteExpr>(e)) {
+        Operand ptr = lower_operand(de->getArgument());
+        BlockId target = new_block(); Terminator t;
+        t.kind = Terminator::Kind::Call; t.call_callee = "operator delete";
+        t.call_args.push_back(std::move(ptr)); t.target = target;
+        terminate(std::move(t)); current_block_ = target;
+        LocalId tmp = declare_local("", "void", false, true); emit(Statement::storage_live(tmp)); return tmp;
+    }
+
+    mark_unsupported(e->getExprLoc(), "expression kind is not represented in MIR");
     LocalId tmp = declare_local("", type_str(e->getType()), false, true);
     emit(Statement::storage_live(tmp));
     return tmp;
