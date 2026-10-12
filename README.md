@@ -38,6 +38,24 @@ dataflow and backward liveness. Any unsupported syntax, unresolved user call,
 MIR failure, or borrow conflict makes the command fail. Unknown effects are
 not accepted as warnings in this mode.
 
+## Opt-in `safe_cpp` dialect
+
+Put `#pragma safe_cpp` at the start of every analyzed translation unit to opt in
+to the `safe_cpp` dialect. A mixed invocation, where only some translation
+units carry the pragma, is rejected. Without the pragma, the existing strict
+profile continues to reject reference parameters and results.
+
+In the dialect, ordinary C++ reference parameters and results are represented
+in MIR. The checker infers return origins from function bodies and propagates
+them through calls. References to local objects may not escape through a
+reference return. Record values and mutable references are consumed as moves;
+scalar values and shared references remain copyable. Moves out of projected
+fields are rejected until field-sensitive move paths are implemented.
+Unreachable CFG blocks with statements are
+rejected. Places accessed through an unresolved reference dereference are
+treated as potentially aliasing any local, so this mode can conservatively
+reject some valid C++ programs while preserving the affine aliasing rule.
+
 ## Accepted subset
 
 The initial policy is intentionally conservative. It is intended for small
@@ -49,13 +67,14 @@ programs whose state is owned by stack locals and ordinary C++ objects:
 - A limited two-phase borrow for mutable method receivers, allowing shared
   reads while the receiver is reserved and before the mutating call activates.
 - Branches and loops represented by the current MIR lowerer.
-- Trivial destruction and ordinary value copying/moving supported by the
-  lowerer and verifier.
+- Trivial destruction and body-defined nontrivial destructors for named
+  locals, when their effects can be represented in MIR.
 
 The checker rejects these features in user code:
 
-- Raw pointers, pointer/reference/array function parameters or results,
-  pointer/reference/array fields, member pointers, and address-taking.
+- Raw pointers and array function parameters or results; reference parameters
+  and results are available only under `#pragma safe_cpp`. Pointer/reference/
+  array fields, member pointers, and address-taking remain unsupported.
 - Global or static storage, arrays and subscripting, range-for, unions,
   `volatile`, mutable fields, virtual methods, function/class templates,
   lambdas, indirect calls, and casts that can forge aliases.
@@ -63,30 +82,37 @@ The checker rejects these features in user code:
   statements or expressions, and calls without a body in the supplied files.
 - A program with no unique `int main()` entry point.
 
-The profile currently disallows pointer and reference parameters and returns,
-so interprocedural aliasing can only arise from references to local objects
-and implicit method receivers. The restrictions are policy checks in addition
-to lowering checks. If a feature is not modeled, it must be rejected before a
-clean result is reported.
+Outside the opt-in dialect, the profile disallows pointer and reference
+parameters and returns. Raw pointers remain disallowed in both modes. The
+restrictions are policy checks in addition to lowering checks. If a feature is
+not modeled, it must be rejected before a clean result is reported.
 
 ## Rust model used as a reference
 
-The implementation takes several structural ideas from Rust's MIR borrow
-checker: control-flow graphs are the analysis unit, loan origins propagate
-through assignments and calls, loans remain live through their reachable uses,
-and accesses are compared with loans at MIR locations. See the Rust compiler
-guide's [MIR dataflow](https://rustc-dev-guide.rust-lang.org/mir/dataflow.html),
+The NLL draft represents reference locals and borrow expressions with region
+variables. It seeds regions from MIR-point liveness, generates location-aware
+outlives constraints for reference assignments, reborrows, calls, and returns,
+and solves them by fixed-point propagation over points reachable within the
+target region. Possible returned origins are inferred across the call graph;
+when multiple reference parameters can reach a result, the checker keeps their
+union. Functions infer per-parameter read/write effects through direct calls
+to a fixed point. Destructor checking uses the same summaries, including
+nested member destructors; a missing or indirect effect summary falls back to
+a conservative deep write. Infinite `for (;;)` loops carry a false unwind
+edge for analysis.
+
+See the Rust compiler guide's [MIR dataflow](https://rustc-dev-guide.rust-lang.org/mir/dataflow.html),
 [region inference](https://rustc-dev-guide.rust-lang.org/borrow-check/region-inference.html),
 and [move and initialization analysis](https://rustc-dev-guide.rust-lang.org/borrow-check/moves-and-initialization.html).
 
-This is not rustc's borrow checker. In particular, safe C++ object semantics,
-drop flags, field-sensitive move paths, destructor effects, aliasing through
-the ABI, and the full Rust region constraint system are not implemented. Local
-definite initialization is tracked per MIR local, not per field; this can
-reject valid field-by-field initialization. Borrow liveness is based on local
-use/def facts, so it is a conservative prototype rather than a formal model
-of all C++ lifetime rules. The strict profile rejects several major aliasing
-features to keep those gaps outside its accepted subset.
+This remains a draft for the project's supported C++ MIR subset, not a complete
+Rust implementation. Rust's `may_dangle` type rules do not map directly to C++.
+Nontrivial temporaries, effects through unsupported indirect/virtual calls,
+every form of infinite-loop false edge, drop flags, and field-sensitive move
+paths remain outside the modeled subset. Local definite initialization is tracked
+per MIR local, so field-by-field initialization can be rejected. The strict
+profile rejects major aliasing features to keep unmodeled C++ behavior out of
+accepted programs.
 
 ## Supported invocation paths
 

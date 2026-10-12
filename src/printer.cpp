@@ -65,6 +65,7 @@ static void print_rvalue(const Rvalue& rv, std::ostream& os) {
         case Rvalue::Kind::Ref:
             os << (rv.ref_mut && *rv.ref_mut ? "&mut " : "&");
             print_place(*rv.ref_place, os);
+            if (rv.borrow_region) os << " as R" << *rv.borrow_region;
             break;
         case Rvalue::Kind::Cast:
             os << "cast<" << rv.cast_type << ">(";
@@ -97,6 +98,7 @@ static void print_statement(const Statement& s, std::ostream& os) {
         case Statement::Kind::ReserveBorrow:
             os << (s.reserve_mut ? "reserve_mut " : "reserve_shared ");
             print_place(*s.place, os);
+            if (s.borrow_region) os << " as R" << *s.borrow_region;
             break;
         case Statement::Kind::Nop: os << "nop"; break;
     }
@@ -155,15 +157,25 @@ static void print_terminator(const Terminator& t, std::ostream& os) {
             if (t.target != INVALID_BLOCK) os << " -> bb" << t.target;
             break;
     }
+    if (t.false_unwind_target)
+        os << " [false unwind -> bb" << *t.false_unwind_target << "]";
 }
 
 void print_body(const Body& body, std::ostream& os) {
     os << "fn " << body.name << "() -> " << body.return_type << " {\n";
 
+    if (!body.regions.empty()) {
+        os << "    // regions\n";
+        for (size_t i = 0; i < body.regions.size(); ++i)
+            os << "    // R" << i << " = " << body.regions[i].name
+               << (body.regions[i].named ? " (named)" : " (inferred)") << "\n";
+    }
+
     os << "    // locals\n";
     for (size_t i = 0; i < body.locals.size(); ++i) {
         const auto& l = body.locals[i];
         os << "    let _" << i << ": " << l.type_name;
+        if (l.reference_region) os << " [R" << *l.reference_region << "]";
         if (!l.name.empty()) os << "  // " << l.name;
         if (l.is_arg)  os << "  // arg";
         if (l.is_temp) os << "  // tmp";

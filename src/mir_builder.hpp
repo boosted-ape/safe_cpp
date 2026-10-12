@@ -13,7 +13,7 @@ struct UnsupportedFeature {
 
 class MIRBuilder : public clang::RecursiveASTVisitor<MIRBuilder> {
 public:
-    explicit MIRBuilder(clang::ASTContext& ctx) : ctx_(ctx) {}
+    explicit MIRBuilder(clang::ASTContext& ctx, bool safe_cpp = false);
     bool VisitFunctionDecl(clang::FunctionDecl* fd);
     std::vector<Body> bodies;
     std::vector<UnsupportedFeature> unsupported_errors;
@@ -22,6 +22,7 @@ public:
 
 private:
     clang::ASTContext& ctx_;
+    bool safe_cpp_ = false;
     Body* body_ = nullptr;
     BlockId current_block_ = 0;
     std::map<const clang::VarDecl*, LocalId> var_to_local_;
@@ -65,6 +66,7 @@ private:
     LocalId lower_expr_to_local(clang::Expr* e);
     LocalId lower_rvalue_to_temp(clang::Expr* e);
     Operand lower_operand(clang::Expr* e);
+    Operand lower_call_argument(clang::Expr* e, clang::QualType parameter_type);
 
     LocalId lower_binary_op(clang::BinaryOperator* bo);
     LocalId lower_logical_and(clang::BinaryOperator* bo);
@@ -73,7 +75,8 @@ private:
     LocalId lower_conditional(clang::ConditionalOperator* co);
     LocalId lower_call(clang::CallExpr* ce);
     LocalId lower_member_call(clang::CXXMemberCallExpr* mce);
-    LocalId lower_construct(clang::CXXConstructExpr* cce);
+    LocalId lower_construct(clang::CXXConstructExpr* cce,
+                            std::optional<LocalId> destination = std::nullopt);
     LocalId lower_init_list(clang::InitListExpr* ile);
 
     std::string type_str(clang::QualType qt);

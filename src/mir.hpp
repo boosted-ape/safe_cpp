@@ -10,7 +10,19 @@ namespace mir {
 
 using LocalId = uint32_t;
 using BlockId = uint32_t;
+using RegionId = uint32_t;
 constexpr BlockId INVALID_BLOCK = ~BlockId(0);
+constexpr RegionId INVALID_REGION = ~RegionId(0);
+
+struct RegionDecl {
+    std::string name;
+    bool named = false;
+};
+
+struct DropField {
+    uint32_t field_index = 0;
+    std::string summary_key;
+};
 
 // ---------- Origin: identifies the source of a loan ----------
 struct Origin {
@@ -115,6 +127,7 @@ struct Rvalue {
     std::optional<Operand> lhs, rhs;
     std::optional<Place> ref_place;
     std::optional<bool>  ref_mut;
+    std::optional<RegionId> borrow_region;
     std::string cast_type;
     std::optional<Aggregate> aggregate;
 
@@ -145,6 +158,7 @@ struct Statement {
     LocalId local = 0;
     std::optional<Place> place;
     std::optional<Rvalue> rvalue;
+    std::optional<RegionId> borrow_region;
     bool reserve_mut = false;
 
     static Statement storage_live(LocalId l) {
@@ -170,6 +184,9 @@ struct Terminator {
     enum class Kind { Goto, SwitchInt, Return, Call, Unreachable, Drop, Throw } kind = Kind::Goto;
 
     BlockId target = 0;
+    // RFC 2094 false-unwind successor: participates in analyses such as
+    // liveness/drop checking, but is not an executable control-flow edge.
+    std::optional<BlockId> false_unwind_target;
     std::optional<Operand> switch_on;
     std::vector<SwitchTarget> switch_targets;
     BlockId switch_default = 0;
@@ -181,6 +198,7 @@ struct Terminator {
     std::optional<Place> call_destination;
     std::optional<Place> call_receiver;
     bool call_receiver_is_mut = false;
+    bool call_result_ref_mut = false;
     bool call_is_virtual = false;
     bool call_is_constructor = false;
     bool call_is_destructor = false;
@@ -220,7 +238,9 @@ struct LocalDecl {
     bool is_mut = true;
     bool is_this = false;
     bool needs_drop = false;
+    std::string drop_summary_key;
     std::optional<Origin> origin;
+    std::optional<RegionId> reference_region;
 };
 
 struct Body {
@@ -228,8 +248,14 @@ struct Body {
     std::string summary_key;
     std::string return_type;
     std::vector<LocalDecl> locals;
+    std::vector<RegionDecl> regions;
     std::vector<BasicBlockData> blocks;
     BlockId start_block = 0;
+    std::optional<RegionId> return_region;
+    std::vector<DropField> drop_fields;
+    bool is_destructor = false;
+    LocalId this_local = INVALID_BLOCK;
+    bool safe_cpp = false;
 };
 
 } // namespace mir

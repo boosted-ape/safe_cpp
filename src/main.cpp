@@ -4,6 +4,7 @@
 #include "verifier.hpp"
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
+#include <clang/Analysis/CFG.h>
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/StmtCXX.h>
@@ -18,6 +19,7 @@
 #include <map>
 #include <set>
 #include <llvm/ADT/SmallString.h>
+#include <llvm/ADT/StringRef.h>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -44,14 +46,16 @@ struct WholeProgramState {
     std::vector<mir::Body> bodies;
     std::vector<WholeProgramCall> calls;
     unsigned main_definitions = 0;
+    unsigned translation_units = 0;
+    unsigned safe_cpp_translation_units = 0;
     unsigned policy_errors = 0;
     unsigned lowering_errors = 0;
 };
 
 class WholeProgramPolicy : public RecursiveASTVisitor<WholeProgramPolicy> {
 public:
-    WholeProgramPolicy(ASTContext& context, WholeProgramState& program)
-        : context_(context), program_(program) {}
+    WholeProgramPolicy(ASTContext& context, WholeProgramState& program, bool safe_cpp)
+        : context_(context), program_(program), safe_cpp_(safe_cpp) {}
 
     bool TraverseFunctionDecl(FunctionDecl* fd) {
         const std::string previous = caller_;
@@ -63,15 +67,16 @@ public:
 
     bool VisitFunctionDecl(FunctionDecl* fd) {
         if (!is_user_code(fd->getLocation())) return true;
-        auto contains_unsafe_indirection = [](QualType type) {
-            return !type.isNull() && (type->isPointerType() || type->isReferenceType()
+        auto contains_unsafe_indirection = [&](QualType type) {
+            return !type.isNull() && (type->isPointerType()
+                || (!safe_cpp_ && type->isReferenceType())
                 || type->isMemberPointerType() || type->isArrayType());
         };
         if (contains_unsafe_indirection(fd->getReturnType()))
-            fail(fd->getLocation(), "whole-program profile forbids pointer, reference, array, or member-pointer returns");
+            fail(fd->getLocation(), "whole-program profile forbids pointer, array, or member-pointer returns");
         for (const ParmVarDecl* param : fd->parameters())
             if (contains_unsafe_indirection(param->getType()))
-                fail(param->getLocation(), "whole-program profile forbids pointer, reference, array, or member-pointer parameters");
+                fail(param->getLocation(), "whole-program profile forbids pointer, array, or member-pointer parameters");
         if (fd->isVariadic())
             fail(fd->getLocation(), "whole-program profile forbids variadic functions");
         if (fd->getNameAsString() == "main" && fd->isGlobal() && fd->doesThisDeclarationHaveABody()) {
@@ -81,6 +86,7 @@ public:
         }
         if (const auto* method = dyn_cast<CXXMethodDecl>(fd))
             if (method->isVirtual()) fail(fd->getLocation(), "whole-program profile forbids virtual methods");
+        if (safe_cpp_ && fd->doesThisDeclarationHaveABody()) check_unreachable(fd);
         return true;
     }
 
@@ -109,8 +115,6 @@ public:
     bool VisitCXXRecordDecl(CXXRecordDecl* record) {
         if (!is_user_code(record->getLocation()) || !record->isThisDeclarationADefinition()) return true;
         if (record->isUnion()) fail(record->getLocation(), "whole-program profile forbids unions");
-        if (const auto* dtor = record->getDestructor())
-            if (!dtor->isTrivial()) fail(dtor->getLocation(), "whole-program profile forbids nontrivial destructors");
         return true;
     }
 
@@ -189,6 +193,7 @@ public:
 private:
     ASTContext& context_;
     WholeProgramState& program_;
+    bool safe_cpp_;
     std::string caller_;
 
     bool is_user_code(SourceLocation loc) const {
@@ -207,12 +212,35 @@ private:
         program_.calls.push_back({caller_, summary_key_for(callee),
             callee->getQualifiedNameAsString(), std::move(where)});
     }
+    void check_unreachable(FunctionDecl* fd) {
+        auto cfg = CFG::buildCFG(fd, fd->getBody(), &context_, CFG::BuildOptions{});
+        if (!cfg) return;
+        std::set<unsigned> reachable;
+        std::vector<const CFGBlock*> work{&cfg->getEntry()};
+        while (!work.empty()) {
+            const CFGBlock* block = work.back();
+            work.pop_back();
+            if (!reachable.insert(block->getBlockID()).second) continue;
+            for (auto successor = block->succ_begin(); successor != block->succ_end(); ++successor)
+                if (const CFGBlock* target = successor->getReachableBlock()) work.push_back(target);
+        }
+        for (const CFGBlock* block : *cfg) {
+            if (reachable.count(block->getBlockID())
+                || (block->empty() && !block->getTerminatorStmt())) continue;
+            fail(fd->getLocation(), "safe_cpp function contains unreachable code");
+            return;
+        }
+    }
 };
 
 class MIRConsumer : public ASTConsumer {
 public:
     MIRConsumer(ASTContext& ctx, WholeProgramState& whole_program)
-        : builder_(ctx), whole_program_(whole_program) {}
+        : safe_cpp_(has_safe_cpp_pragma(ctx.getSourceManager())),
+          builder_(ctx, safe_cpp_), whole_program_(whole_program) {
+        ++whole_program_.translation_units;
+        if (safe_cpp_) ++whole_program_.safe_cpp_translation_units;
+    }
 
     void HandleTranslationUnit(ASTContext& ctx) override {
         builder_.TraverseDecl(ctx.getTranslationUnitDecl());
@@ -222,13 +250,30 @@ public:
             ctx.getDiagnostics().Report(e.location, id) << e.message;
             ++whole_program_.lowering_errors;
         }
-        WholeProgramPolicy policy(ctx, whole_program_);
+        WholeProgramPolicy policy(ctx, whole_program_, safe_cpp_);
         policy.TraverseDecl(ctx.getTranslationUnitDecl());
         whole_program_.bodies.insert(whole_program_.bodies.end(), builder_.bodies.begin(), builder_.bodies.end());
     }
 private:
+    bool safe_cpp_;
     mir::MIRBuilder builder_;
     WholeProgramState& whole_program_;
+
+    static bool has_safe_cpp_pragma(const SourceManager& source_manager) {
+        bool invalid = false;
+        const llvm::StringRef source = source_manager.getBufferData(
+            source_manager.getMainFileID(), &invalid);
+        if (invalid) return false;
+        size_t start = 0;
+        while (start < source.size()) {
+            size_t end = source.find('\n', start);
+            if (end == llvm::StringRef::npos) end = source.size();
+            llvm::StringRef line = source.slice(start, end).trim();
+            if (!line.empty()) return line == "#pragma safe_cpp";
+            start = end + (end < source.size());
+        }
+        return false;
+    }
 };
 
 class MIRAction : public ASTFrontendAction {
@@ -250,6 +295,11 @@ private:
 };
 
 static int finish_whole_program(WholeProgramState& state) {
+    if (state.safe_cpp_translation_units
+        && state.safe_cpp_translation_units != state.translation_units) {
+        llvm::errs() << "safe_cpp requires #pragma safe_cpp at the top of every analyzed translation unit\n";
+        return 1;
+    }
     if (state.policy_errors || state.lowering_errors) return 1;
     if (state.main_definitions != 1) {
         llvm::errs() << "whole-program profile requires exactly one definition of int main() with no parameters\n";
@@ -271,6 +321,7 @@ static int finish_whole_program(WholeProgramState& state) {
     for (const auto& body : state.bodies)
         if (body.summary_key.empty() || seen.insert(body.summary_key).second) bodies.push_back(body);
     const auto summaries = mir::compute_return_borrow_summaries(bodies);
+    const auto drop_effects = mir::compute_drop_effect_summaries(bodies);
     unsigned errors = 0;
     for (const auto& body : bodies) {
         mir::print_body(body, std::cout);
@@ -281,7 +332,7 @@ static int finish_whole_program(WholeProgramState& state) {
             for (const auto& error : verified.errors) llvm::errs() << "MIR verification failed in " << body.name << ": " << error << "\n";
             continue;
         }
-        for (const auto& diagnostic : mir::check_borrows(body, summaries)) {
+        for (const auto& diagnostic : mir::check_borrows(body, summaries, drop_effects)) {
             std::cout << "  // BORROW ERROR in " << body.name << " at bb" << diagnostic.block << ":" << diagnostic.stmt
                       << " — " << diagnostic.message << "\n";
             llvm::errs() << "borrow error in " << body.name << " at bb" << diagnostic.block << ":" << diagnostic.stmt

@@ -26,6 +26,8 @@ struct Ctx {
     }
     void check_operand(const Operand& o, const std::string& where) {
         if (o.kind != Operand::Kind::Constant) check_place(o.place, where);
+        if (body->safe_cpp && o.kind == Operand::Kind::Move && !o.place.is_plain_local())
+            err(where + ": moving out of a projected place is unsupported by local-level move tracking");
     }
 };
 } // namespace
@@ -111,6 +113,7 @@ VerifyResult verify_body(const Body& body) {
                 if (t.target != INVALID_BLOCK) ctx.check_block(t.target, where);
                 break;
         }
+        if (t.false_unwind_target) ctx.check_block(*t.false_unwind_target, where);
 
     }
     if (!ctx.r.ok) return ctx.r;

@@ -14,6 +14,9 @@ using namespace clang;
 
 namespace mir {
 
+MIRBuilder::MIRBuilder(ASTContext& ctx, bool safe_cpp)
+    : ctx_(ctx), safe_cpp_(safe_cpp) {}
+
 static std::string summary_key_for(const Decl* decl) {
     if (!decl) return {};
     llvm::SmallString<128> usr;
@@ -22,6 +25,14 @@ static std::string summary_key_for(const Decl* decl) {
         return named->getQualifiedNameAsString();
     }
     return {};
+}
+
+static void set_drop_info(LocalDecl& local, QualType type) {
+    const auto* record = type.isNull() ? nullptr : type->getAsCXXRecordDecl();
+    const CXXDestructorDecl* dtor = record ? record->getDestructor() : nullptr;
+    if (!dtor || dtor->isTrivial()) return;
+    local.needs_drop = true;
+    local.drop_summary_key = summary_key_for(dtor);
 }
 
 void MIRBuilder::mark_unsupported(SourceLocation location, std::string message) {
@@ -110,11 +121,20 @@ BlockId MIRBuilder::new_block() {
 
 void MIRBuilder::emit(Statement s) {
     if (is_terminated()) return;
+    if (s.kind == Statement::Kind::ReserveBorrow && !s.borrow_region) {
+        s.borrow_region = static_cast<RegionId>(body_->regions.size());
+        body_->regions.push_back({"borrow_" + std::to_string(*s.borrow_region), false});
+    }
     body_->blocks[current_block_].statements.push_back(std::move(s));
 }
 
 void MIRBuilder::emit_assign(Place dest, Rvalue rv) {
     if (is_terminated()) return;
+
+    if (rv.kind == Rvalue::Kind::Ref && !rv.borrow_region) {
+        rv.borrow_region = static_cast<RegionId>(body_->regions.size());
+        body_->regions.push_back({"borrow_" + std::to_string(*rv.borrow_region), false});
+    }
 
     LocalId dest_local = dest.local;
     BlockId blk = current_block_;
@@ -184,9 +204,22 @@ bool MIRBuilder::VisitFunctionDecl(FunctionDecl* fd) {
     if (ctx_.getSourceManager().isInSystemHeader(fd->getLocation())) return true;
 
     Body body;
+    body.safe_cpp = safe_cpp_;
     body.name = fd->getQualifiedNameAsString();
     body.summary_key = summary_key_for(fd);
     body.return_type = type_str(fd->getReturnType());
+    body.is_destructor = llvm::isa<CXXDestructorDecl>(fd);
+    if (const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(fd)) {
+        for (const FieldDecl* field : dtor->getParent()->fields()) {
+            const auto* field_record = field->getType()->getAsCXXRecordDecl();
+            const CXXDestructorDecl* field_dtor = field_record
+                ? field_record->getDestructor() : nullptr;
+            if (field_dtor && !field_dtor->isTrivial())
+                body.drop_fields.push_back({
+                    static_cast<uint32_t>(field->getFieldIndex()),
+                    summary_key_for(field_dtor)});
+        }
+    }
     body_ = &body;
     var_to_local_.clear();
     scopes_.clear();
@@ -207,6 +240,7 @@ bool MIRBuilder::VisitFunctionDecl(FunctionDecl* fd) {
         std::string tname = parent->getNameAsString() + "*";
         this_local_ = declare_local("this", tname, true, false,
                                     /*is_mut=*/!is_const, /*is_this=*/true);
+        body.this_local = this_local_;
         body.locals[this_local_].type.kind = Type::Kind::RawPtr;
         emit(Statement::storage_live(this_local_));
     }
@@ -215,8 +249,7 @@ bool MIRBuilder::VisitFunctionDecl(FunctionDecl* fd) {
         LocalId lid = declare_local(param->getNameAsString(),
                                     type_str(param->getType()), true, false);
         body.locals[lid].type = build_type(param->getType());
-        if (const auto* rd = param->getType()->getAsCXXRecordDecl())
-            body.locals[lid].needs_drop = rd->hasNonTrivialDestructor();
+        set_drop_info(body.locals[lid], param->getType());
         var_to_local_[param] = lid;
         emit(Statement::storage_live(lid));
     }
@@ -224,6 +257,22 @@ bool MIRBuilder::VisitFunctionDecl(FunctionDecl* fd) {
     lower_stmt(fd->getBody());
     pop_scope();
     if (!is_terminated()) terminate(Terminator::ret());
+
+    // Give every reference-typed MIR local a distinct inferred lifetime
+    // variable. Reference parameters stand for caller-provided named regions;
+    // local reference variables receive point-inferred regions.
+    for (LocalId local = 0; local < body.locals.size(); ++local) {
+        if (body.locals[local].type.kind != Type::Kind::Ref) continue;
+        RegionId region = static_cast<RegionId>(body.regions.size());
+        body.locals[local].reference_region = region;
+        body.regions.push_back({body.locals[local].is_arg
+            ? "param_" + std::to_string(local)
+            : "local_" + std::to_string(local), body.locals[local].is_arg});
+    }
+    if (fd->getReturnType()->isReferenceType()) {
+        body.return_region = static_cast<RegionId>(body.regions.size());
+        body.regions.push_back({"return", true});
+    }
 
     bodies.push_back(std::move(body));
     body_ = nullptr;
@@ -238,19 +287,55 @@ void MIRBuilder::lower_decl_stmt(DeclStmt* ds) {
             LocalId lid = declare_local(vd->getNameAsString(), type_str(vd->getType()),
                                         false, false, is_mut);
             body_->locals[lid].type = build_type(vd->getType());
-            if (const auto* rd = vd->getType()->getAsCXXRecordDecl())
-                body_->locals[lid].needs_drop = rd->hasNonTrivialDestructor();
+            set_drop_info(body_->locals[lid], vd->getType());
             var_to_local_[vd] = lid;
             emit(Statement::storage_live(lid));
             if (vd->hasInit()) {
                 if (vd->getType()->isReferenceType()) {
                     Expr* init = vd->getInit()->IgnoreParenImpCasts();
-                    Place referent = lower_expr(init);
-                    bool mut = !vd->getType().getNonReferenceType().isConstQualified();
-                    emit_assign(Place{lid}, Rvalue::ref(referent, mut));
+                    const VarDecl* source_ref = nullptr;
+                    if (auto* dre = llvm::dyn_cast<DeclRefExpr>(init))
+                        source_ref = llvm::dyn_cast<VarDecl>(dre->getDecl());
+                    if (source_ref && source_ref->getType()->isReferenceType()) {
+                        auto source = var_to_local_.find(source_ref);
+                        if (source != var_to_local_.end()) {
+                            const bool move_ref = source->second < body_->locals.size()
+                                && body_->locals[source->second].type.is_mut;
+                            Operand value = move_ref
+                                ? Operand::make_move(Place{source->second}, type_str(source_ref->getType()))
+                                : Operand::make_copy(Place{source->second}, type_str(source_ref->getType()));
+                            emit_assign(Place{lid}, Rvalue::use(std::move(value)));
+                        }
+                    } else if (auto* call = llvm::dyn_cast<CallExpr>(init);
+                               call && call->getDirectCallee()
+                                   && call->getDirectCallee()->getReturnType()->isReferenceType()) {
+                        LocalId source = lower_expr(init).local;
+                        Operand value = source < body_->locals.size() && body_->locals[source].type.is_mut
+                            ? Operand::make_move(Place{source}, type_str(vd->getType()))
+                            : Operand::make_copy(Place{source}, type_str(vd->getType()));
+                        emit_assign(Place{lid}, Rvalue::use(std::move(value)));
+                    } else {
+                        Place referent = lower_expr(init);
+                        if (referent.is_plain_local()
+                            && referent.local < body_->locals.size()
+                            && body_->locals[referent.local].type.kind == Type::Kind::Ref) {
+                            Operand value = body_->locals[referent.local].type.is_mut
+                                ? Operand::make_move(referent, type_str(vd->getType()))
+                                : Operand::make_copy(referent, type_str(vd->getType()));
+                            emit_assign(Place{lid}, Rvalue::use(std::move(value)));
+                        } else {
+                            bool mut = !vd->getType().getNonReferenceType().isConstQualified();
+                            emit_assign(Place{lid}, Rvalue::ref(referent, mut));
+                        }
+                    }
                 } else {
-                    Operand val = lower_operand(vd->getInit());
-                    emit_assign(Place{lid}, Rvalue::use(val));
+                    Expr* init = vd->getInit()->IgnoreParenImpCasts();
+                    if (auto* construct = llvm::dyn_cast<CXXConstructExpr>(init))
+                        (void)lower_construct(construct, lid);
+                    else {
+                        Operand val = lower_operand(vd->getInit());
+                        emit_assign(Place{lid}, Rvalue::use(val));
+                    }
                 }
             }
         }
@@ -345,7 +430,11 @@ void MIRBuilder::lower_for_stmt(ForStmt* fs) {
 
     current_block_ = inc_bb;
     if (fs->getInc()) lower_stmt(fs->getInc());
-    if (!is_terminated()) terminate(Terminator::goto_(header));
+    if (!is_terminated()) {
+        Terminator backedge = Terminator::goto_(header);
+        if (!fs->getCond()) backedge.false_unwind_target = exit_bb;
+        terminate(std::move(backedge));
+    }
 
     current_block_ = exit_bb;
     pop_scope();
@@ -636,6 +725,19 @@ Operand MIRBuilder::lower_operand(Expr* e) {
     return Operand::make_copy(p, type_str(e->getType()));
 }
 
+Operand MIRBuilder::lower_call_argument(Expr* e, QualType parameter_type) {
+    if (!parameter_type.isNull() && parameter_type->isReferenceType()) {
+        Place referent = lower_expr(e);
+        LocalId temp = declare_local("", type_str(parameter_type), false, true);
+        body_->locals[temp].type = build_type(parameter_type);
+        emit(Statement::storage_live(temp));
+        const bool is_mut = !parameter_type.getNonReferenceType().isConstQualified();
+        emit_assign(Place{temp}, Rvalue::ref(std::move(referent), is_mut));
+        return Operand::make_copy(Place{temp}, type_str(parameter_type));
+    }
+    return lower_operand(e);
+}
+
 LocalId MIRBuilder::lower_binary_op(BinaryOperator* bo) {
     Operand l = lower_operand(bo->getLHS());
     Operand r = lower_operand(bo->getRHS());
@@ -773,11 +875,23 @@ LocalId MIRBuilder::lower_conditional(ConditionalOperator* co) {
 
 LocalId MIRBuilder::lower_call(CallExpr* ce) {
     std::vector<Operand> args;
-    for (auto* a : ce->arguments()) args.push_back(lower_operand(a));
+    const FunctionDecl* direct_callee = ce->getDirectCallee();
+    unsigned arg_index = 0;
+    for (auto* a : ce->arguments()) {
+        QualType parameter_type;
+        if (direct_callee && arg_index < direct_callee->getNumParams())
+            parameter_type = direct_callee->getParamDecl(arg_index)->getType();
+        args.push_back(lower_call_argument(a, parameter_type));
+        ++arg_index;
+    }
 
     QualType ret_qt = ce->getCallReturnType(ctx_);
     LocalId dest = declare_local("", type_str(ret_qt), false, true);
     body_->locals[dest].type = build_type(ret_qt);
+    set_drop_info(body_->locals[dest], ret_qt);
+    if (body_->locals[dest].needs_drop)
+        mark_unsupported(ce->getBeginLoc(),
+            "nontrivial temporary destructor lifetime is not represented in MIR");
     emit(Statement::storage_live(dest));
 
     std::string callee_name;
@@ -827,11 +941,22 @@ LocalId MIRBuilder::lower_member_call(CXXMemberCallExpr* mce) {
     }
 
     std::vector<Operand> args;
-    for (auto* a : mce->arguments()) args.push_back(lower_operand(a));
+    unsigned arg_index = 0;
+    for (auto* a : mce->arguments()) {
+        QualType parameter_type;
+        if (md && arg_index < md->getNumParams())
+            parameter_type = md->getParamDecl(arg_index)->getType();
+        args.push_back(lower_call_argument(a, parameter_type));
+        ++arg_index;
+    }
 
     QualType ret_qt = mce->getCallReturnType(ctx_);
     LocalId dest = declare_local("", type_str(ret_qt), false, true);
     body_->locals[dest].type = build_type(ret_qt);
+    set_drop_info(body_->locals[dest], ret_qt);
+    if (body_->locals[dest].needs_drop)
+        mark_unsupported(mce->getBeginLoc(),
+            "nontrivial temporary destructor lifetime is not represented in MIR");
     emit(Statement::storage_live(dest));
 
     BlockId target = new_block();
@@ -843,6 +968,8 @@ LocalId MIRBuilder::lower_member_call(CXXMemberCallExpr* mce) {
     t.call_destination = Place{dest};
     t.call_receiver = receiver;
     t.call_receiver_is_mut = receiver_is_mut;
+    t.call_result_ref_mut = ret_qt->isReferenceType()
+        && !ret_qt.getNonReferenceType().isConstQualified();
     t.receiver_reservation = reservation;
     t.call_is_virtual = md ? md->isVirtual() : false;
     t.target = target;
@@ -851,14 +978,24 @@ LocalId MIRBuilder::lower_member_call(CXXMemberCallExpr* mce) {
     return dest;
 }
 
-LocalId MIRBuilder::lower_construct(CXXConstructExpr* cce) {
+LocalId MIRBuilder::lower_construct(CXXConstructExpr* cce,
+                                    std::optional<LocalId> destination) {
     std::vector<Operand> args;
     for (auto* a : cce->arguments()) args.push_back(lower_operand(a));
 
     QualType qt = cce->getType();
-    LocalId dest = declare_local("", type_str(qt), false, true);
-    body_->locals[dest].type = build_type(qt);
-    emit(Statement::storage_live(dest));
+    LocalId dest;
+    if (destination) {
+        dest = *destination;
+    } else {
+        dest = declare_local("", type_str(qt), false, true);
+        body_->locals[dest].type = build_type(qt);
+        set_drop_info(body_->locals[dest], qt);
+        if (body_->locals[dest].needs_drop)
+            mark_unsupported(cce->getBeginLoc(),
+                "nontrivial temporary destructor lifetime is not represented in MIR");
+        emit(Statement::storage_live(dest));
+    }
 
     const CXXConstructorDecl* ctor = cce->getConstructor();
     std::string name = ctor ? ctor->getQualifiedNameAsString() : "<ctor>";
@@ -883,6 +1020,11 @@ LocalId MIRBuilder::lower_init_list(InitListExpr* ile) {
     for (auto* e : ile->inits()) elems.push_back(lower_operand(e));
 
     LocalId tmp = declare_local("", type_str(qt), false, true);
+    body_->locals[tmp].type = build_type(qt);
+    set_drop_info(body_->locals[tmp], qt);
+    if (body_->locals[tmp].needs_drop)
+        mark_unsupported(ile->getBeginLoc(),
+            "nontrivial temporary destructor lifetime is not represented in MIR");
     emit(Statement::storage_live(tmp));
 
     Aggregate agg;
